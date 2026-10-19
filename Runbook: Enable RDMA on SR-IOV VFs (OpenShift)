@@ -1,0 +1,462 @@
+# Runbook: Enable RDMA on SR-IOV VFs (OpenShift)
+
+| Field | Value |
+|---|---|
+| Runbook ID | RB-SRIOV-RDMA-001 |
+| Cluster | lab4.srib-lab-ocp.lan (master1/2/3, control-plane + worker) |
+| Platform | OpenShift 4.14 / 4.18, SR-IOV Network Operator |
+| Hardware | Intel E810, vendor `8086`, device `1593`, driver `ice`, 25 GbE |
+| Target PF | `ens1f2` (PCI `0000:11:00.2`) – VFs 9–12 |
+| Change type | Node configuration change – possible drain/reboot |
+| Estimated duration | 60–90 min (including node sync) |
+| Risk | Medium – shared PF with existing BPP/BIP VF groups |
+| Rollback time | ~15 min |
+
+---
+
+## 1. Purpose
+
+Enable RoCEv2 RDMA on a dedicated group of SR-IOV virtual functions so that RDMA-capable workloads (AI/GPU training, MPI, NVMe-oF, RDMA storage) can be scheduled on the cluster, without affecting the existing BPP (`vfio-pci`) and BIP (`netdevice`) VF groups.
+
+## 2. Scope
+
+**In scope**
+- New `SriovNetworkNodePolicy` with `isRdma: true` on `ens1f2` VFs 9–12
+- New `SriovNetwork` and resulting NetworkAttachmentDefinition
+- Functional validation with `perftest`
+
+**Out of scope**
+- Switch PFC/ECN configuration (prerequisite, owned by network team)
+- Changing `rdmaMode` from `shared` to `exclusive`
+- Any change to existing policies `policy-ens1f2-bh0u`, `policy-ens1f2-bh0c`, or other PFs
+
+## 3. Roles
+
+| Role | Responsibility |
+|---|---|
+| Change executor | Runs all `oc` steps, owns validation and rollback |
+| Network team | Confirms PFC/ECN/VLAN on switch ports before start |
+| Application owner | Provides RDMA test image, confirms workload expectations |
+| Approver | Approves change window and go/no-go after pre-checks |
+
+---
+
+## 4. Pre-change checklist
+
+Complete every item before the change window. Record results in the Sign-off table (Section 10).
+
+### 4.1 Network fabric (network team)
+
+- [ ] PFC enabled on RoCE priority (default priority 3) on all server-facing ports for `ens1f2`
+- [ ] ECN / DCQCN enabled for the RoCE traffic class
+- [ ] RoCE VLAN (`<VLAN_ID>`) allowed on the trunk to each server
+- [ ] UDP port 4791 not blocked between nodes
+- [ ] MTU consistent end to end
+
+### 4.2 Cluster health
+
+```bash
+oc get nodes
+oc get co | grep -v "True        False         False"
+oc get sriovnetworknodestates -n openshift-sriov-network-operator
+```
+
+- [ ] All nodes `Ready`
+- [ ] No degraded cluster operators
+- [ ] All node states `Succeeded / Idle / Idle`
+
+### 4.3 Current SR-IOV state on `ens1f2`
+
+```bash
+oc get sriovnetworknodepolicy -n openshift-sriov-network-operator
+oc get sriovnetworknodestates -n openshift-sriov-network-operator master1.lab4.srib-lab-ocp.lan -o yaml | grep -A12 "name: ens1f2"
+```
+
+Expected spec section:
+
+```yaml
+- name: ens1f2
+  numVfs: 16
+  pciAddress: "0000:11:00.2"
+  vfGroups:
+  - deviceType: vfio-pci
+    policyName: policy-ens1f2-bh0u
+    vfRange: 0-3
+  - deviceType: netdevice
+    policyName: policy-ens1f2-bh0c
+    vfRange: 4-8
+```
+
+- [ ] `numVfs` = 16 (new policy must use the same value)
+- [ ] VFs 9–15 unassigned
+- [ ] `rdmaMode: shared` present under `status.system`
+
+### 4.4 Workload impact assessment
+
+```bash
+oc get pods -A -o json | jq -r '.items[] | select(.spec.containers[].resources.requests | keys[]? | startswith("openshift.io/pci_sriov")) | "\(.metadata.namespace)/\(.metadata.name) \(.spec.nodeName)"'
+```
+
+- [ ] List of pods currently using SR-IOV VFs recorded
+- [ ] Application owners informed that nodes may drain one at a time
+
+### 4.5 Artifacts ready
+
+- [ ] `sriov-rdma-node-policy.yaml` (Section 5.2)
+- [ ] `sriov-rdma-network.yaml` (Section 5.3)
+- [ ] `rdma-test-pod.yaml` (Section 6.1)
+- [ ] RDMA test image available in registry (`rdma-core`, `libibverbs`, `perftest` installed)
+- [ ] Console / BMC access to all three servers in case of reboot
+
+### 4.6 Backup
+
+```bash
+mkdir -p ~/ocp-config/backup-$(date +%F)
+oc get sriovnetworknodepolicy -n openshift-sriov-network-operator -o yaml > ~/ocp-config/backup-$(date +%F)/nodepolicies.yaml
+oc get sriovnetwork -n openshift-sriov-network-operator -o yaml > ~/ocp-config/backup-$(date +%F)/networks.yaml
+oc get sriovnetworknodestates -n openshift-sriov-network-operator -o yaml > ~/ocp-config/backup-$(date +%F)/nodestates.yaml
+```
+
+- [ ] Backup taken
+
+**Go / No-go:** proceed only if all boxes above are checked.
+
+---
+
+## 5. Change procedure
+
+### 5.1 Create target namespace
+
+```bash
+oc new-project rdma-app
+```
+
+### 5.2 Apply RDMA node policy
+
+`sriov-rdma-node-policy.yaml`:
+
+```yaml
+apiVersion: sriovnetwork.openshift.io/v1
+kind: SriovNetworkNodePolicy
+metadata:
+  name: policy-ens1f2-rdma
+  namespace: openshift-sriov-network-operator
+spec:
+  resourceName: rdma_sriov_net
+  nodeSelector:
+    feature.node.kubernetes.io/network-sriov.capable: "true"
+  priority: 99
+  numVfs: 16
+  nicSelector:
+    vendor: "8086"
+    deviceID: "1593"
+    pfNames: ["ens1f2#9-12"]
+  deviceType: netdevice
+  isRdma: true
+  linkType: eth
+```
+
+```bash
+oc apply -f sriov-rdma-node-policy.yaml
+```
+
+Expected:
+
+```
+sriovnetworknodepolicy.sriovnetwork.openshift.io/policy-ens1f2-rdma created
+```
+
+If the webhook rejects the policy, stop and check Section 8.
+
+### 5.3 Monitor node sync
+
+```bash
+watch oc get sriovnetworknodestates -n openshift-sriov-network-operator
+```
+
+Nodes move `Idle → Drain_Required → Draining → InProgress → Idle` one at a time. Wait until all three show:
+
+```
+NAME                            SYNC STATUS   DESIRED SYNC STATE   CURRENT SYNC STATE
+master1.lab4.srib-lab-ocp.lan   Succeeded     Idle                 Idle
+master2.lab4.srib-lab-ocp.lan   Succeeded     Idle                 Idle
+master3.lab4.srib-lab-ocp.lan   Succeeded     Idle                 Idle
+```
+
+If a node reboots, watch its console and wait for `Ready` before continuing. Do not apply further changes while any node is not `Idle`.
+
+### 5.4 Confirm resource advertised
+
+```bash
+oc describe nodes | grep rdma_sriov_net
+```
+
+Expected on each node:
+
+```
+openshift.io/rdma_sriov_net:   4
+```
+
+### 5.5 Confirm VF binding on a node
+
+```bash
+ssh core@master1.lab4.srib-lab-ocp.lan
+ip link show ens1f2 | grep -E "vf (9|10|11|12) "
+rdma link show
+lsmod | grep irdma
+exit
+```
+
+Expected: `rdma link show` lists one `rocep17s0f2v<N>` device per RDMA VF with `state ACTIVE`.
+
+### 5.6 Apply SriovNetwork
+
+`sriov-rdma-network.yaml`:
+
+```yaml
+apiVersion: sriovnetwork.openshift.io/v1
+kind: SriovNetwork
+metadata:
+  name: rdma-net
+  namespace: openshift-sriov-network-operator
+spec:
+  resourceName: rdma_sriov_net
+  networkNamespace: rdma-app
+  vlan: <VLAN_ID>          # remove this line if the RoCE network is untagged
+  spoofChk: "off"
+  trust: "on"
+  ipam: |
+    {
+      "type": "whereabouts",
+      "range": "192.168.30.0/24",
+      "exclude": ["192.168.30.1/32"]
+    }
+```
+
+```bash
+oc apply -f sriov-rdma-network.yaml
+oc get net-attach-def -n rdma-app
+```
+
+Expected:
+
+```
+NAME       AGE
+rdma-net   5s
+```
+
+---
+
+## 6. Validation
+
+### 6.1 Deploy test pods on two nodes
+
+`rdma-test-pod.yaml` (deploy twice, changing `name` and `nodeName`):
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rdma-test-1
+  namespace: rdma-app
+  annotations:
+    k8s.v1.cni.cncf.io/networks: rdma-net
+spec:
+  nodeName: master1.lab4.srib-lab-ocp.lan
+  containers:
+  - name: perftest
+    image: <registry>/rdma-perftest:latest
+    command: ["sleep", "infinity"]
+    securityContext:
+      capabilities:
+        add: ["IPC_LOCK"]
+    resources:
+      requests:
+        openshift.io/rdma_sriov_net: "1"
+        cpu: "2"
+        memory: "4Gi"
+      limits:
+        openshift.io/rdma_sriov_net: "1"
+        cpu: "2"
+        memory: "4Gi"
+```
+
+```bash
+oc apply -f rdma-test-pod.yaml          # rdma-test-1 on master1
+oc apply -f rdma-test-pod-2.yaml        # rdma-test-2 on master2
+oc get pod -n rdma-app -o wide
+```
+
+- [ ] Both pods `Running`
+
+### 6.2 Device visible in pod
+
+```bash
+oc exec -n rdma-app rdma-test-1 -- ls /dev/infiniband
+oc exec -n rdma-app rdma-test-1 -- ibv_devinfo
+oc exec -n rdma-app rdma-test-1 -- ip -4 addr show net1
+```
+
+- [ ] `uverbs0` and `rdma_cm` present
+- [ ] `ibv_devinfo` shows `state: PORT_ACTIVE`, `link_layer: Ethernet`
+- [ ] `net1` has an IP from the whereabouts range
+
+Record device name (`<DEV>`) and IP of each pod.
+
+### 6.3 Connectivity
+
+```bash
+oc exec -n rdma-app rdma-test-1 -- ping -c 3 <IP_OF_POD_2>
+```
+
+- [ ] Ping succeeds
+
+### 6.4 RDMA bandwidth
+
+Terminal 1 (server):
+
+```bash
+oc exec -n rdma-app rdma-test-2 -- ib_write_bw -d <DEV> -F --report_gbits
+```
+
+Terminal 2 (client):
+
+```bash
+oc exec -n rdma-app rdma-test-1 -- ib_write_bw -d <DEV> -F --report_gbits <IP_OF_POD_2>
+```
+
+- [ ] Average bandwidth ≥ 20 Gb/s on 25 GbE
+
+### 6.5 RDMA latency
+
+```bash
+# server
+oc exec -n rdma-app rdma-test-2 -- ib_write_lat -d <DEV> -F
+# client
+oc exec -n rdma-app rdma-test-1 -- ib_write_lat -d <DEV> -F <IP_OF_POD_2>
+```
+
+- [ ] Typical latency ≤ 10 µs
+
+### 6.6 Multi-stream (PFC check)
+
+```bash
+# server
+oc exec -n rdma-app rdma-test-2 -- ib_write_bw -d <DEV> -F --report_gbits -q 8
+# client
+oc exec -n rdma-app rdma-test-1 -- ib_write_bw -d <DEV> -F --report_gbits -q 8 <IP_OF_POD_2>
+```
+
+- [ ] Aggregate bandwidth stays ≥ 20 Gb/s (a sharp drop indicates PFC not active on the switch)
+
+### 6.7 Regression check on existing VF groups
+
+```bash
+oc describe nodes | grep pci_sriov
+oc get pods -A -o wide | grep -E "<existing-sriov-app-namespace>"
+```
+
+- [ ] `pci_sriov_net_bh0u` = 4 and `pci_sriov_net_bh0c` = 5 on every node (unchanged)
+- [ ] Existing BPP/BIP pods `Running` and passing their own health checks
+
+### 6.8 Cleanup test pods
+
+```bash
+oc delete pod rdma-test-1 rdma-test-2 -n rdma-app
+```
+
+---
+
+## 7. Rollback
+
+Trigger rollback if: node fails to return to `Idle` within 30 min, existing BPP/BIP resources change, or validation in Section 6 fails and cannot be resolved within the change window.
+
+```bash
+oc delete sriovnetwork rdma-net -n openshift-sriov-network-operator
+oc delete sriovnetworknodepolicy policy-ens1f2-rdma -n openshift-sriov-network-operator
+watch oc get sriovnetworknodestates -n openshift-sriov-network-operator
+```
+
+Wait for all nodes `Succeeded / Idle / Idle`, then verify:
+
+```bash
+oc describe nodes | grep -E "rdma_sriov_net|pci_sriov"
+```
+
+- `rdma_sriov_net` no longer listed
+- `pci_sriov_net_bh0u` = 4, `pci_sriov_net_bh0c` = 5 unchanged
+
+`numVfs` on `ens1f2` remains 16, so a reboot is not expected during rollback. If the cluster is still inconsistent, restore from backup:
+
+```bash
+oc apply -f ~/ocp-config/backup-<date>/nodepolicies.yaml
+```
+
+---
+
+## 8. Troubleshooting
+
+| Symptom | Likely cause | Action |
+|---|---|---|
+| Webhook rejects policy | `isRdma` with `vfio-pci`, overlapping VF range, or `numVfs` mismatch | Check `deviceType: netdevice`, range `9-12`, `numVfs: 16` |
+| Node stuck in `Draining` | Pod with PDB or local storage blocking eviction | `oc get events -n openshift-sriov-network-operator`, `oc adm drain` dry-run on the node |
+| Node stuck in `InProgress` > 30 min | Config daemon error | `oc logs -n openshift-sriov-network-operator ds/sriov-network-config-daemon --all-containers` on that node |
+| `rdma_sriov_net` = 0 | `irdma` not loaded or VF not RDMA-enabled | `lsmod \| grep irdma`, `rdma link show` on node |
+| Pod `Pending` | Resource typo or no free VFs | `oc describe pod`, `oc describe node \| grep rdma` |
+| `/dev/infiniband` empty in pod | Device plugin did not inject devices | `oc logs -n openshift-sriov-network-operator ds/sriov-device-plugin` on that node |
+| `ibv_reg_mr` fails | Missing `IPC_LOCK` | Check pod `securityContext` |
+| `ib_write_bw` hangs | UDP 4791 blocked, wrong GID, VLAN not trunked | `show_gids` in pod, ping over `net1`, confirm VLAN with network team |
+| Single stream OK, multi-stream collapses | PFC/ECN not configured | Escalate to network team; `ethtool -S ens1f2 \| grep -i pause` on node |
+| `PORT_DOWN` in `ibv_devinfo` | PF link down | `ip link show ens1f2` on node |
+
+Useful log sources:
+
+```bash
+oc logs -n openshift-sriov-network-operator deploy/sriov-network-operator
+oc logs -n openshift-sriov-network-operator ds/sriov-network-config-daemon --all-containers
+oc logs -n openshift-sriov-network-operator ds/sriov-device-plugin
+journalctl -u kubelet -b | grep -i sriov        # on the node
+dmesg | grep -iE "irdma|iavf|ice"                # on the node
+```
+
+---
+
+## 9. Post-change
+
+- [ ] Update cluster configuration repository with the two new YAML files
+- [ ] Update SR-IOV section of the cluster design document (new VF allocation table below)
+- [ ] Inform application owner that `openshift.io/rdma_sriov_net` and network `rdma-net` are available in namespace `rdma-app`
+- [ ] Close change record
+
+Updated VF allocation on `ens1f2` (per node):
+
+| VF range | Policy | Device type | RDMA | Resource name | Consumer |
+|---|---|---|---|---|---|
+| 0–3 | policy-ens1f2-bh0u | vfio-pci | no | pci_sriov_net_bh0u | BPP (DPDK) |
+| 4–8 | policy-ens1f2-bh0c | netdevice | no | pci_sriov_net_bh0c | BIP |
+| 9–12 | policy-ens1f2-rdma | netdevice | **yes** | rdma_sriov_net | RDMA workloads |
+| 13–15 | unassigned | – | – | – | spare |
+
+---
+
+## 10. Sign-off
+
+| Step | Result (Pass/Fail) | Executed by | Time | Notes |
+|---|---|---|---|---|
+| 4. Pre-change checklist | | | | |
+| 5.2 Policy applied | | | | |
+| 5.3 All nodes Idle | | | | |
+| 5.4 Resource advertised | | | | |
+| 5.6 SriovNetwork applied | | | | |
+| 6.2 Device visible in pod | | | | |
+| 6.4 Bandwidth | | | | |
+| 6.5 Latency | | | | |
+| 6.6 Multi-stream | | | | |
+| 6.7 Regression on existing VFs | | | | |
+| 9. Post-change | | | | |
+
+| Role | Name | Signature | Date |
+|---|---|---|---|
+| Change executor | | | |
+| Network team | | | |
+| Approver | | | |
