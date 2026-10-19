@@ -1,0 +1,356 @@
+# RDMA on OpenShift SR-IOV
+
+Scope: what RDMA is, when it is needed, and how to enable it on SR-IOV virtual functions using the OpenShift SR-IOV Network Operator. Hardware reference: Intel E810 (vendor `8086`, device `1593`, driver `ice`), 25 GbE, OpenShift 4.14 / 4.18.
+
+---
+
+## 1. What is RDMA
+
+RDMA (Remote Direct Memory Access) is a data transfer method where the network adapter reads from and writes to application memory directly, on both the sending and receiving host, without involving the operating system kernel in the data path.
+
+### 1.1 Normal network path vs RDMA path
+
+| Step | Normal socket path (TCP/IP) | RDMA path |
+|---|---|---|
+| Application sends data | `send()` on a socket | Posts a work request pointing at a registered memory buffer |
+| Kernel involvement | Copies data into kernel buffers, runs TCP/IP, raises interrupts | None – kernel is bypassed |
+| CPU cost per byte | High – scales with throughput | Near zero – the NIC does the work |
+| Latency | Tens of microseconds | Low single-digit microseconds |
+| Receiving side | Kernel receives, copies into application buffer | NIC writes straight into the remote application buffer |
+
+The result is very low latency, high throughput and almost no CPU consumption for data movement. The price is that both ends must be RDMA-capable, the memory must be pinned, and (on Ethernet) the fabric must be configured to be lossless.
+
+### 1.2 RDMA transports
+
+| Transport | Medium | Notes |
+|---|---|---|
+| InfiniBand | Dedicated IB fabric | Native RDMA, needs IB switches and a subnet manager |
+| RoCEv2 | Standard Ethernet, UDP port 4791 | Most common in data centres; **this is what the E810 uses** |
+| iWARP | Ethernet, runs over TCP | Older, less common |
+
+On the E810, RDMA is provided by the `irdma` kernel driver running on top of the `ice` (PF) and `iavf` (VF) drivers.
+
+### 1.3 How RDMA fits on an SR-IOV VF
+
+Enabling RDMA does not replace the normal network interface on a VF. It adds a second device on top of the same VF:
+
+```
+VF 9 on ens1f2 (deviceType: netdevice)
+ ├── iavf driver  -> ens1f2v9        (normal IP interface, TCP/UDP apps)
+ └── irdma driver -> rocep17s0f2v9   (RDMA verbs device, only with isRdma: true)
+```
+
+Applications that use sockets keep using the `iavf` interface. Applications that use RDMA verbs open the `irdma` device.
+
+---
+
+## 2. When RDMA is required
+
+Enable RDMA **only** when a workload actually uses it. An RDMA application can be recognised by:
+
+- It links against `libibverbs` / `librdmacm` (or `libfabric` / UCX built on them)
+- It requires `/dev/infiniband/*` devices inside the pod
+- Its documentation mentions RoCE, InfiniBand, "verbs", or GPUDirect
+
+### 2.1 Typical RDMA consumers
+
+| Area | Examples |
+|---|---|
+| AI / GPU training | NCCL, RCCL, oneCCL, PyTorch/TensorFlow multi-node, DeepSpeed, vLLM sharding |
+| HPC | Open MPI, MPICH, Intel MPI, MVAPICH2; WRF, OpenFOAM, GROMACS, LAMMPS |
+| Storage | NVMe-oF/RDMA, iSER, SMB Direct, Lustre, GPFS, BeeGFS, WekaFS, Ceph RDMA messenger |
+| Databases | Oracle RAC / Exadata, SAP HANA scale-out, SQL Server over SMB Direct |
+| Virtualisation | VMware vSAN / vMotion RDMA, Storage Spaces Direct |
+
+### 2.2 Workloads that do NOT need RDMA
+
+| Workload type | Why RDMA is not needed |
+|---|---|
+| DPDK user-plane pods (`deviceType: vfio-pci`) | The application owns the whole VF in userspace; neither `iavf` nor `irdma` is loaded. `isRdma` does not apply and is rejected by the operator webhook. |
+| Ordinary kernel networking pods (OAM, signalling, HTTP, gRPC) | They use sockets, which go through `iavf`. An RDMA device would be present but never opened. |
+
+In the current cluster configuration (BPP = `vfio-pci`, BIP = `netdevice`) every policy correctly has `isRdma: false`. The configuration below is for onboarding a future RDMA consumer.
+
+---
+
+## 3. Prerequisites
+
+### 3.1 Network fabric (switch side)
+
+RoCEv2 assumes a lossless network. Request the following from the network team on every switch port carrying RoCE traffic:
+
+- **PFC (Priority Flow Control)** enabled on the RoCE traffic class (commonly priority 3)
+- **ECN / DCQCN** congestion control enabled for that class
+- **DSCP/CoS trust** so the priority marking from the VF is honoured
+- RoCE VLAN carried on the trunk to each server port
+- Consistent **MTU** end to end (RoCE prefers 4096 or 9000 if jumbo frames are enabled)
+- UDP **port 4791** not filtered anywhere in the path
+
+Without PFC, RoCE works at low load and collapses under multiple streams.
+
+### 3.2 Server / NIC
+
+- Intel E810 with current NVM / DDP package (RDMA supported)
+- `irdma` kernel module available on RHCOS (included in supported OpenShift versions)
+- SR-IOV already enabled on the PF (existing policies on `ens1f2`, `ens3f2`, `ens4f2`, `ens7f2` confirm this)
+
+### 3.3 OpenShift
+
+- SR-IOV Network Operator installed and `SriovNetworkNodeState` showing `syncStatus: Succeeded`
+- Spare VF indexes on the chosen PF (for example `ens1f2` VFs 9–15 are currently unassigned)
+
+---
+
+## 4. Configuration
+
+### 4.1 Check the current RDMA mode
+
+```bash
+oc get sriovnetworknodestates -n openshift-sriov-network-operator -o yaml | grep rdmaMode
+```
+
+Expected output on the current cluster:
+
+```
+rdmaMode: shared
+```
+
+| Mode | Behaviour | When to use |
+|---|---|---|
+| `shared` (default) | All RDMA devices live in the host network namespace; the device plugin injects the correct `/dev/infiniband/*` character devices into each pod | Standard choice; works for almost all workloads |
+| `exclusive` | Each pod sees only the RDMA device bound to its own VF (RDMA network namespace isolation) | Strict multi-tenant isolation requirements |
+
+Switching to `exclusive` requires a node reboot. Only change it if there is a specific isolation requirement:
+
+```yaml
+apiVersion: sriovnetwork.openshift.io/v1
+kind: SriovNetworkPoolConfig
+metadata:
+  name: rdma-exclusive
+  namespace: openshift-sriov-network-operator
+spec:
+  rdmaMode: exclusive
+  nodeSelector:
+    matchLabels:
+      feature.node.kubernetes.io/network-sriov.capable: "true"
+```
+
+### 4.2 Create the RDMA node policy
+
+Rules that must be respected:
+
+- `deviceType` must be `netdevice` – `isRdma: true` with `vfio-pci` is rejected
+- `numVfs` must be **identical** on every policy that targets the same PF (16 on `ens1f2`)
+- VF ranges must not overlap with existing policies (`ens1f2#0-3` and `ens1f2#4-8` are in use)
+- Do not set `mtu` in the node policy (known issue from OCP 4.14.30 onwards; set MTU elsewhere if needed)
+
+`sriov-rdma-node-policy.yaml`:
+
+```yaml
+apiVersion: sriovnetwork.openshift.io/v1
+kind: SriovNetworkNodePolicy
+metadata:
+  name: policy-ens1f2-rdma
+  namespace: openshift-sriov-network-operator
+spec:
+  resourceName: rdma_sriov_net
+  nodeSelector:
+    feature.node.kubernetes.io/network-sriov.capable: "true"
+  priority: 99
+  numVfs: 16
+  nicSelector:
+    vendor: "8086"
+    deviceID: "1593"
+    pfNames: ["ens1f2#9-12"]
+  deviceType: netdevice
+  isRdma: true
+  linkType: eth
+```
+
+Apply:
+
+```bash
+oc apply -f sriov-rdma-node-policy.yaml
+```
+
+Because `numVfs` is unchanged, the operator only rebinds VFs 9–12; the node should not need a full VF re-creation, but it may still drain and reboot depending on the operator version. Monitor:
+
+```bash
+oc get sriovnetworknodestates -n openshift-sriov-network-operator
+# wait for SYNC STATUS = Succeeded and CURRENT SYNC STATE = Idle on all nodes
+```
+
+Confirm the new resource is advertised:
+
+```bash
+oc describe nodes | grep rdma_sriov_net
+#   openshift.io/rdma_sriov_net:   4
+```
+
+### 4.3 Create the SriovNetwork
+
+`sriov-rdma-network.yaml`:
+
+```yaml
+apiVersion: sriovnetwork.openshift.io/v1
+kind: SriovNetwork
+metadata:
+  name: rdma-net
+  namespace: openshift-sriov-network-operator
+spec:
+  resourceName: rdma_sriov_net
+  networkNamespace: rdma-app          # namespace where the RDMA pods run
+  vlan: 300                           # RoCE VLAN, if tagged; remove if untagged
+  spoofChk: "off"
+  trust: "on"
+  ipam: |
+    {
+      "type": "whereabouts",
+      "range": "192.168.30.0/24",
+      "exclude": ["192.168.30.1/32"]
+    }
+```
+
+- `trust: "on"` allows the VF to set its own priority / VLAN tags, which PFC relies on
+- `spoofChk: "off"` avoids drops when the RDMA stack uses the VF's own MAC with different priorities
+
+Apply and verify the NetworkAttachmentDefinition was generated:
+
+```bash
+oc apply -f sriov-rdma-network.yaml
+oc get net-attach-def -n rdma-app
+# rdma-net
+```
+
+### 4.4 Deploy an RDMA pod
+
+The container image must contain the RDMA userspace stack (`rdma-core`, `libibverbs`, `librdmacm`) and, for testing, `perftest`.
+
+`rdma-test-pod.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rdma-test
+  namespace: rdma-app
+  annotations:
+    k8s.v1.cni.cncf.io/networks: rdma-net
+spec:
+  containers:
+  - name: perftest
+    image: <registry>/rdma-perftest:latest
+    command: ["sleep", "infinity"]
+    securityContext:
+      capabilities:
+        add: ["IPC_LOCK"]            # required to pin memory for RDMA
+    resources:
+      requests:
+        openshift.io/rdma_sriov_net: "1"
+        cpu: "2"
+        memory: "4Gi"
+      limits:
+        openshift.io/rdma_sriov_net: "1"
+        cpu: "2"
+        memory: "4Gi"
+```
+
+`IPC_LOCK` is mandatory. Without it `ibv_reg_mr` fails because the process cannot lock memory. Set `requests = limits` so the pod is Guaranteed QoS.
+
+Deploy one pod per node (change the name) for cross-node testing:
+
+```bash
+oc apply -f rdma-test-pod.yaml
+oc get pod -n rdma-app -o wide
+```
+
+---
+
+## 5. Verification
+
+### 5.1 On the node
+
+```bash
+ssh core@master1.lab4.srib-lab-ocp.lan
+
+# irdma devices for the RDMA VFs
+rdma link show
+# link rocep17s0f2v9/1 state ACTIVE physical_state LINK_UP netdev ens1f2v9
+# ...
+
+ibv_devices
+lsmod | grep irdma
+```
+
+### 5.2 Inside the pod
+
+```bash
+oc exec -n rdma-app rdma-test -- ls /dev/infiniband
+# rdma_cm  uverbs0
+
+oc exec -n rdma-app rdma-test -- ibv_devinfo
+# hca_id: rocep17s0f2v9
+#   transport: InfiniBand (0)
+#   ...
+#   port: 1
+#     state: PORT_ACTIVE (4)
+#     link_layer: Ethernet
+
+oc exec -n rdma-app rdma-test -- show_gids
+# pick the GID index for RoCE v2 on the correct IPv4 address
+```
+
+### 5.3 Bandwidth and latency between two nodes
+
+Server pod:
+
+```bash
+ib_write_bw -d rocep17s0f2v9 -F --report_gbits
+```
+
+Client pod (replace `<server-ip>` with the server pod's RDMA interface IP):
+
+```bash
+ib_write_bw -d rocep17s0f2v9 -F --report_gbits <server-ip>
+ib_write_lat -d rocep17s0f2v9 -F <server-ip>
+```
+
+Expected on 25 GbE: roughly 22–23 Gb/s and 3–5 µs write latency. Also run `-q 4` (multiple QPs) to confirm throughput holds under parallel streams; if it drops sharply, PFC is not working on the switch.
+
+---
+
+## 6. Troubleshooting
+
+| Symptom | Likely cause | Check |
+|---|---|---|
+| Policy rejected by webhook | `isRdma: true` with `deviceType: vfio-pci`, or VF range overlap / `numVfs` mismatch | Policy YAML against existing policies on the same PF |
+| Node resource `rdma_sriov_net` = 0 | Policy did not sync, or `irdma` not loaded | `oc get sriovnetworknodestates`, `lsmod | grep irdma` on node |
+| Pod stuck `Pending` | Resource name typo, or no free VFs on any node | `oc describe pod`, `oc describe nodes | grep rdma` |
+| `ibv_devinfo` shows no device | `/dev/infiniband` not injected (wrong rdmaMode state) or policy not RDMA | `ls /dev/infiniband` in pod, confirm `isRdma: true` |
+| `ibv_reg_mr` / memory registration fails | Missing `IPC_LOCK` | Pod `securityContext.capabilities` |
+| `ib_write_bw` hangs at connection | UDP 4791 blocked, wrong GID index, VLAN missing on trunk | `show_gids`, `ping` over RDMA interface, switch VLAN config |
+| Good single-stream bandwidth, poor multi-stream | PFC/ECN not configured | Switch QoS configuration, `ethtool -S ens1f2 | grep -i pause` |
+| Port state `PORT_DOWN` | PF link down or VLAN / link admin state | `ip link show ens1f2`, `SriovNetworkNodeState` link info |
+
+---
+
+## 7. Removal
+
+To remove RDMA capability without touching the other VF groups:
+
+```bash
+oc delete sriovnetwork rdma-net -n openshift-sriov-network-operator
+oc delete sriovnetworknodepolicy policy-ens1f2-rdma -n openshift-sriov-network-operator
+```
+
+VFs 9–12 return to the default `iavf` binding with no RDMA device; `numVfs` on `ens1f2` stays at 16, so no node reboot is expected.
+
+---
+
+## 8. Summary
+
+- RDMA = NIC moves data directly between application memories, bypassing the kernel; on E810 this is RoCEv2 via the `irdma` driver.
+- Enable it per VF group with `deviceType: netdevice` + `isRdma: true`; the VF keeps its normal `iavf` interface and gains an RDMA device.
+- The switch fabric must be lossless (PFC + ECN) and UDP 4791 must be open.
+- Pods need `IPC_LOCK`, the RDMA resource request, and an image with `rdma-core`.
+- Only enable RDMA for workloads that actually use verbs (AI/GPU, HPC/MPI, NVMe-oF, RDMA storage). DPDK (`vfio-pci`) and plain socket workloads do not need it.
